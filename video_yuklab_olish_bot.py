@@ -4,23 +4,31 @@ import yt_dlp
 import os
 import time
 import subprocess
-import sqlite3 # Ma'lumotlar bazasi uchun
+# SQLite/Fayl tizimi muammosini hal qilish uchun quyidagi importlar qo'shildi
+import random
+import string
+import json 
+import datetime
 
 # --- 1. KONFIGURATSIYA VA XAVFSIZLIK ---
-# BOT_TOKEN va ADMIN_ID ni Render'ning Environment Variables (Atrof-muhit o'zgaruvchilari) orqali yuklash
+# Environment Variables orqali TOKEN va ADMIN_ID ni yuklash
 TOKEN = os.environ.get('BOT_TOKEN') 
-ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
+try:
+    ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
+except ValueError:
+    ADMIN_ID = 0
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN atrof-muhit o'zgaruvchisi topilmadi!")
 
 bot = telebot.TeleBot(TOKEN)
 DOWNLOAD_DIR = 'downloads'
-DB_NAME = 'bot_data.db'
+SETTINGS_FILE = 'bot_settings.json' # DB o'rniga oddiy JSON fayl (ma'lumotlar yo'qolishi mumkin)
+USER_FILE = 'users.json' # Foydalanuvchilar ro'yxati
 
 # Watermark Konfiguratsiyasi
 WATERMARK_TEXT = '@podshox_bot'
-# Render uchun shrift yo'li (agar FFmpeg to'g'ri o'rnatilsa)
+# Render uchun shrift yo'li (Debian asosidagi image da joylashgan)
 FONT_FILE_PATH = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' 
 FONT_SIZE = 30
 FONT_COLOR = 'white'
@@ -37,56 +45,52 @@ BOT_STATUS = {
     'watermark_enabled': True, 
     'maintenance_mode': False
 }
+USER_DATA = {}
 
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
 
-# --- 2. MA'LUMOTLAR BAZASI (SQLITE) FUNKSIYALARI ---
+# --- 2. MA'LUMOTLARNI SAQLASH (Faqat Render Worker uchun vaqtinchalik yechim) ---
 
-def init_db():
-    """Ma'lumotlar bazasini yaratadi."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, added_at TEXT)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-    conn.commit()
-    conn.close()
-
-def load_settings():
-    """DB'dan sozlamalarni yuklaydi."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    for key, default_val in BOT_STATUS.items():
-        cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
-        val = cursor.fetchone()
-        if val:
-            # DB'dan olingan qiymatni boolean ga aylantirish
-            BOT_STATUS[key] = val[0] == 'True'
-        else:
-            cursor.execute("INSERT INTO settings VALUES (?, ?)", (key, str(default_val)))
-    conn.commit()
-    conn.close()
-
-def update_setting(key, value):
-    """Sozlamalarni DB'da yangilaydi."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE settings SET value=? WHERE key=?", (str(value), key))
-    conn.commit()
-    conn.close()
+def load_data():
+    """Sozlamalar va foydalanuvchilarni fayllardan yuklaydi."""
+    global BOT_STATUS, USER_DATA
+    # Sozlamalar
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, 'r') as f:
+            data = json.load(f)
+            # JSON'dan yuklangan qiymatlarni Boolean'ga aylantirish
+            for key, val in data.items():
+                if key in BOT_STATUS:
+                    BOT_STATUS[key] = val
     
+    # Foydalanuvchilar
+    if os.path.exists(USER_FILE):
+        with open(USER_FILE, 'r') as f:
+            USER_DATA = json.load(f)
+
+def save_settings():
+    """Sozlamalarni faylga saqlaydi."""
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(BOT_STATUS, f)
+
+def save_users():
+    """Foydalanuvchilarni faylga saqlaydi."""
+    with open(USER_FILE, 'w') as f:
+        json.dump(USER_DATA, f)
+
 def add_user(user_id):
-    """Yangi foydalanuvchini DB'ga qo'shadi."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    try:
-        cursor.execute("INSERT INTO users VALUES (?, datetime('now'))", (user_id,))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    conn.close()
-    
+    """Yangi foydalanuvchini ro'yxatga qo'shadi."""
+    user_id_str = str(user_id)
+    if user_id_str not in USER_DATA:
+        USER_DATA[user_id_str] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_users() # Har bir qo'shishdan keyin saqlash
+
 # --- 3. YORDAMCHI FUNKSIYALAR ---
+
+def generate_random_id(length=8):
+    """Fayl nomlari uchun tasodifiy ID yaratadi."""
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 def draw_progress_bar(progress):
     """Foiz qiymatiga asoslanib, progress bar chizadi."""
@@ -119,6 +123,7 @@ def progress_hook(d, bot, chat_id, message_id):
             progress_bar = draw_progress_bar(progress)
             speed = d.get('speed')
             
+            # Yangilanishni har 2 sekundda bir marta cheklash
             current_time = time.time()
             if not hasattr(progress_hook, 'last_update') or current_time - progress_hook.last_update > 2:
                 
@@ -131,9 +136,11 @@ def progress_hook(d, bot, chat_id, message_id):
                 try:
                     bot.edit_message_text(status_text, chat_id, message_id, parse_mode='Markdown')
                     progress_hook.last_update = current_time
-                except:
-                    pass
-        
+                except telebot.apihelper.ApiTelegramException as e:
+                    # Agar xabar o'chirilgan bo'lsa yoki o'zgarishsiz bo'lsa, e'tibor bermaslik
+                    if "message is not modified" not in str(e):
+                         pass
+
 # --- 4. TELEGRAM HANDLERLAR (Admin va Foydalanuvchi) ---
 
 @bot.message_handler(commands=['start', 'help'])
@@ -152,11 +159,7 @@ def handle_admin_commands(message):
 
     # --- /stats ---
     if command == '/stats':
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM users")
-        user_count = cursor.fetchone()[0]
-        conn.close()
+        user_count = len(USER_DATA)
         
         wm_status = "✅ Yoqilgan" if BOT_STATUS['watermark_enabled'] else "❌ O'chirilgan"
         
@@ -173,7 +176,7 @@ def handle_admin_commands(message):
     elif command in ['/watermark_off', '/watermark_on']:
         is_on = command == '/watermark_on'
         BOT_STATUS['watermark_enabled'] = is_on
-        update_setting('watermark_enabled', is_on)
+        save_settings()
         status = "YOQILDI" if is_on else "O'CHIRILDI"
         bot.send_message(chat_id, f"💧 Watermark qo'shish funksiyasi muvaffaqiyatli **{status}**.")
     
@@ -181,7 +184,7 @@ def handle_admin_commands(message):
     elif command in ['/maintenance_on', '/maintenance_off']:
         is_on = command == '/maintenance_on'
         BOT_STATUS['maintenance_mode'] = is_on
-        update_setting('maintenance_mode', is_on)
+        save_settings()
         status = "YOQILDI" if is_on else "O'CHIRILDI"
         bot.send_message(chat_id, f"🛠 Texnik xizmat ko'rsatish rejimi muvaffaqiyatli **{status}**.")
         
@@ -193,24 +196,19 @@ def handle_admin_commands(message):
             bot.send_message(chat_id, "⚠️ Foydalanish: `/broadcast Xabar matni`")
             return
             
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users")
-        users = cursor.fetchall()
-        conn.close()
-        
         sent_count = 0
+        failed_count = 0
         
-        bot.send_message(chat_id, f"📢 **{len(users)}** ta foydalanuvchiga xabar yuborilmoqda...")
+        bot.send_message(chat_id, f"📢 **{len(USER_DATA)}** ta foydalanuvchiga xabar yuborilmoqda...")
         
-        for user in users:
+        for user_id_str in USER_DATA:
             try:
-                bot.send_message(user[0], message_to_send, parse_mode='Markdown')
+                bot.send_message(int(user_id_str), message_to_send, parse_mode='Markdown')
                 sent_count += 1
             except:
-                pass 
+                failed_count += 1
                 
-        bot.send_message(chat_id, f"✅ **{sent_count}** ta foydalanuvchiga xabar muvaffaqiyatli yetkazildi.")
+        bot.send_message(chat_id, f"✅ **{sent_count}** ta foydalanuvchiga xabar yuborildi. ❌ **{failed_count}** ta yuborilmadi.")
 
 
 @bot.message_handler(func=lambda message: True)
@@ -280,6 +278,7 @@ def callback_inline(call):
         call.message.message_id
     )
     
+    temp_id = generate_random_id()
     input_file_path = None
     output_file_path = None
     file_path_to_send = None
@@ -287,7 +286,7 @@ def callback_inline(call):
     try:
         # 1. Yuklab olish (yt-dlp)
         ydl_opts = {
-            'outtmpl': os.path.join(DOWNLOAD_DIR, 'input_%(id)s.%(ext)s'),
+            'outtmpl': os.path.join(DOWNLOAD_DIR, f'input_{temp_id}.%(ext)s'), # Fayl nomi optimallashtirildi
             'format': ydl_format,
             'max_filesize': max_size_limit, 
             'noplaylist': True,
@@ -298,14 +297,24 @@ def callback_inline(call):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             progress_hook.last_update = time.time() 
             info = ydl.extract_info(url, download=True)
-            input_file_path = ydl.prepare_filename(info)
+            # Eng so'nggi yuklab olingan fayl nomini aniqlash
+            if format_code == 'audio_only':
+                input_file_path = os.path.join(DOWNLOAD_DIR, f'input_{temp_id}.mp3')
+            else:
+                # Video formatini aniqlashda yordam beradi (masalan, .mp4)
+                potential_ext = info.get('ext')
+                if potential_ext:
+                    input_file_path = os.path.join(DOWNLOAD_DIR, f'input_{temp_id}.{potential_ext}')
+                else:
+                    input_file_path = ydl.prepare_filename(info) # Aniq nomni olib keladi
 
         bot.edit_message_text("✅ **Yuklab olish yakunlandi.** Endi qayta ishlanmoqda (Watermark).", chat_id, processing_message.message_id)
             
         # 2. Watermark Qo'shish (FFmpeg)
         if format_code != 'audio_only' and BOT_STATUS['watermark_enabled']: 
             
-            output_file_path = os.path.join(DOWNLOAD_DIR, 'output_' + os.path.basename(input_file_path))
+            # Chiqarish fayli nomini alohida yaratamiz
+            output_file_path = os.path.join(DOWNLOAD_DIR, f'output_{temp_id}.mp4')
             
             ffmpeg_command = [
                 'ffmpeg',
@@ -314,6 +323,9 @@ def callback_inline(call):
                 f"drawtext=fontfile='{FONT_FILE_PATH}':text='{WATERMARK_TEXT}':"
                 f"fontsize={FONT_SIZE}:fontcolor={FONT_COLOR}:box=1:boxcolor={TEXT_BORDER}@0.7:"
                 f"x={POSITION_X}:y={POSITION_Y}",
+                '-c:v', 'libx264', # Encoder qo'shildi
+                '-preset', 'fast', # Tezroq ishlov berish uchun
+                '-crf', '23', 
                 '-c:a', 'copy',
                 '-y',
                 output_file_path
@@ -338,28 +350,38 @@ def callback_inline(call):
                 else:
                     bot.send_video(chat_id, media_file, caption=caption, supports_streaming=True)
         else:
-             bot.send_message(chat_id, "❌ **Xatolik!** Fayl topilmadi.")
+             bot.send_message(chat_id, "❌ **Xatolik!** Fayl topilmadi. (2-bosqich)")
 
+    except yt_dlp.utils.DownloadError as e:
+        error_message = f"❌ **Yuklashda xatolik!**\nSababi: Video topilmadi yoki yuklab olish mumkin emas."
+        bot.send_message(chat_id, error_message, parse_mode='Markdown')
+    except subprocess.CalledProcessError as e:
+        error_message = f"❌ **FFmpeg/Qayta ishlashda xatolik!**\nSababi: `{e.stderr.decode()[:150]}...`"
+        bot.send_message(chat_id, error_message, parse_mode='Markdown')
     except Exception as e:
-        error_message = f"❌ **Kechirasiz, xatolik yuz berdi.**\nSababi: `{str(e)[:150]}...`"
+        error_message = f"❌ **Kechirasiz, boshqa xatolik yuz berdi.**\nSababi: `{str(e)[:150]}...`"
         bot.send_message(chat_id, error_message, parse_mode='Markdown')
 
     finally:
-        # 4. Vaqtincha fayllarni o'chirish
-        bot.delete_message(chat_id, call.message.message_id)
+        # 4. Vaqtincha fayllarni o'chirish (fayl borligini tekshirish muhim)
+        try:
+            bot.delete_message(chat_id, call.message.message_id)
+        except:
+            pass # Agar xabar allaqachon o'chirilgan bo'lsa
+            
         if input_file_path and os.path.exists(input_file_path):
             os.remove(input_file_path)
         if output_file_path and os.path.exists(output_file_path):
             os.remove(output_file_path)
-
+        
 # --- 5. BOTNI ISHGA TUSHIRISH ---
 
 if __name__ == '__main__':
-    init_db()       
-    load_settings()
-    print("Bot ishga tushdi...")
+    load_data() # Sozlamalar va foydalanuvchilarni yuklash
+    print("Bot ishga tushdi (Long Polling Worker)...")
     try:
-        bot.polling(none_stop=True)
+        # Bu buyruq botni Render'da Worker rejimida ishlashini ta'minlaydi.
+        bot.polling(none_stop=True, interval=0, timeout=20) 
     except Exception as e:
         print(f"Bot ishga tushishida xatolik: {e}")
-                                                                  
+
